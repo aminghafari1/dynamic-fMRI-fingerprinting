@@ -1,0 +1,468 @@
+import numpy as np
+from scipy.spatial.distance import pdist
+from scipy.cluster.hierarchy import linkage, fcluster
+from scipy.stats import rankdata, t as _t_dist, pearsonr
+from sklearn.linear_model import LinearRegression
+from sklearn.model_selection import LeaveOneOut
+
+
+# ── Low-level helpers ─────────────────────────────────────────────────────────
+
+def _fc_from_ts(ts):
+    """Fisher-z FC matrix from a (n_timepoints, n_rois) array."""
+    corr = np.corrcoef(ts.T)
+    np.fill_diagonal(corr, 0)
+    return np.arctanh(np.clip(corr, -0.9999, 0.9999))
+
+
+def _vectorize(fc_windows):
+    """
+    Upper-triangle vectorization of FC windows.
+    Input : (n, n_rois, n_rois)
+    Output: (n, n_edges)
+    """
+    n_rois = fc_windows.shape[1]
+    idx_i, idx_j = np.triu_indices(n_rois, k=1)
+    return fc_windows[:, idx_i, idx_j]
+
+
+def _strength_vectors(fc_windows):
+    """
+    Row sum of FC matrices → overall connectivity strength per region.
+    Input : (n, n_rois, n_rois)
+    Output: (n, n_rois)
+    """
+    return fc_windows.sum(axis=-1)
+
+
+def _featurize(fc_windows, feature_type):
+    """Route FC windows to the appropriate feature representation."""
+    if feature_type == 'strength':
+        return _strength_vectors(fc_windows)
+    return _vectorize(fc_windows)
+
+
+def _spearman_batch(X, y):
+    """
+    Vectorized Spearman r and two-tailed p for each column of X against y.
+    Input : X (n, p), y (n,)
+    Output: rhos (p,), pvals (p,)
+    """
+    n   = len(y)
+    Xr  = rankdata(X, axis=0)
+    yr  = rankdata(y)
+    Xrc = Xr - Xr.mean(0)
+    yrc = yr - yr.mean()
+    rhos   = (Xrc * yrc[:, np.newaxis]).sum(0) / (
+        np.linalg.norm(Xrc, axis=0) * np.linalg.norm(yrc) + 1e-12
+    )
+    t_stat = rhos * np.sqrt((n - 2) / np.maximum(1 - rhos ** 2, 1e-12))
+    pvals  = 2 * _t_dist.sf(np.abs(t_stat), df=n - 2)
+    return rhos, pvals
+
+
+def _hierarchical_cluster(fc_windows, n_clusters, feature_type='connectome'):
+    """
+    Agglomerative clustering with 1-correlation distance and average linkage.
+
+    Parameters
+    ----------
+    fc_windows   : (n, n_rois, n_rois)
+    n_clusters   : int
+    feature_type : 'connectome' | 'strength'
+
+    Returns
+    -------
+    centroids : (k, n_rois, n_rois)  mean FC matrix per cluster
+    """
+    n_rois = fc_windows.shape[1]
+    k      = min(n_clusters, len(fc_windows))
+
+    if len(fc_windows) == 1:
+        return fc_windows.copy()
+
+    vecs   = _featurize(fc_windows, feature_type)
+    dists  = pdist(vecs, metric='correlation')
+    Z      = linkage(dists, method='average')
+    labels = fcluster(Z, k, criterion='maxclust') - 1  # 0-indexed
+
+    centroids = np.zeros((k, n_rois, n_rois))
+    for c in range(k):
+        mask = labels == c
+        centroids[c] = fc_windows[mask].mean(0) if mask.sum() > 0 else fc_windows[0]
+    return centroids
+
+
+# ── Core pipeline ─────────────────────────────────────────────────────────────
+
+def sliding_window_fc(ts, window_size):
+    """
+    Sliding window FC with stride=1.
+
+    Parameters
+    ----------
+    ts          : (n_timepoints, n_rois)
+    window_size : int, number of TRs per window
+
+    Returns
+    -------
+    fc_windows : (n_windows, n_rois, n_rois)  Fisher-z FC per window
+    """
+    n_tp, n_rois = ts.shape
+    n_windows    = n_tp - window_size + 1
+    fc_windows   = np.zeros((n_windows, n_rois, n_rois))
+    for i in range(n_windows):
+        fc_windows[i] = _fc_from_ts(ts[i: i + window_size])
+    return fc_windows
+
+
+def fit_brain_states(ts_list, window_size, n_subject_clusters=20, n_states=7,
+                     seed=42, feature_type='connectome'):
+    """
+    Define brain states from a list of training time series.
+
+    The grand mean FC (averaged across all windows and all subjects) is
+    subtracted before clustering so that states represent dynamic fluctuations
+    rather than the dominant static connectivity pattern.
+
+    Both CN and MCI training subjects should be passed together so that
+    brain states are shared across groups.
+
+    Parameters
+    ----------
+    ts_list            : list of (n_timepoints, n_rois) — training subjects
+    window_size        : int
+    n_subject_clusters : int, within-subject clusters (default 20)
+    n_states           : int, final brain states (default 7)
+    seed               : int (unused — hierarchical clustering is deterministic)
+    feature_type       : 'connectome' — cluster on upper-triangle FC vectors
+                         'strength'   — cluster on per-region connectivity strength
+
+    Returns
+    -------
+    brain_states  : (n_states, n_rois, n_rois)  cluster centroids as FC matrices
+    grand_mean_fc : (n_rois, n_rois)            mean FC subtracted before clustering
+    """
+    print("  computing sliding-window FC ...")
+    all_fc_windows = []
+    for ts in ts_list:
+        all_fc_windows.append(sliding_window_fc(ts, window_size))
+    ## give me shape of all_fc_windows: list of (n_windows_i, n_rois, n_rois)
+    print(f"  {len(all_fc_windows)} subjects, {all_fc_windows[0].shape[1]} ROIs")    
+
+    grand_mean_fc = np.concatenate(all_fc_windows, axis=0).mean(0)
+
+    print("  within-subject clustering ...")
+    all_centroids = []
+    for i, fc_windows in enumerate(all_fc_windows):
+        residuals = fc_windows - grand_mean_fc[np.newaxis]
+        centroids = _hierarchical_cluster(residuals, n_subject_clusters, feature_type)
+        all_centroids.append(centroids)
+        if (i + 1) % 10 == 0 or i == len(all_fc_windows) - 1:
+            print(f"    {i+1}/{len(all_fc_windows)}")
+
+    all_centroids = np.concatenate(all_centroids, axis=0)
+    print(f"  second-level clustering: {len(all_centroids)} centroids → {n_states} brain states")
+    brain_states = _hierarchical_cluster(all_centroids, n_states, feature_type)
+
+    return brain_states, grand_mean_fc
+
+
+def transform_subject(ts, brain_states, grand_mean_fc, window_size,
+                      feature_type='connectome'):
+    """
+    Assign a single subject's windows to brain states and extract features.
+
+    Window residuals (raw FC − grand_mean_fc) are featurized and compared to
+    brain state centroids using Pearson correlation in feature space. The
+    fingerprint is the raw FC averaged per state (grand mean added back) for
+    interpretability.
+
+    Parameters
+    ----------
+    ts            : (n_timepoints, n_rois)
+    brain_states  : (n_states, n_rois, n_rois)  output of fit_brain_states
+    grand_mean_fc : (n_rois, n_rois)             output of fit_brain_states
+    window_size   : int
+    feature_type  : 'connectome' | 'strength'
+
+    Returns
+    -------
+    labels      : (n_windows,)              state index per window
+    fingerprint : (n_states, n_rois, n_rois) per-state mean raw FC
+    dwell_time  : (n_states,)               fraction of windows in each state
+    transitions : (n_states, n_states)      row-normalised transition probabilities
+    """
+    n_states   = len(brain_states)
+    fc_windows = sliding_window_fc(ts, window_size)
+    residuals  = fc_windows - grand_mean_fc[np.newaxis]
+
+    state_vecs  = _featurize(brain_states, feature_type)   # (n_states, n_features)
+    window_vecs = _featurize(residuals, feature_type)      # (n_windows, n_features)
+    wv    = window_vecs - window_vecs.mean(axis=1, keepdims=True)
+    sv    = state_vecs  - state_vecs.mean(axis=1, keepdims=True)
+    numer = wv @ sv.T
+    denom = (np.linalg.norm(wv, axis=1, keepdims=True)
+             * np.linalg.norm(sv, axis=1)[np.newaxis, :]) + 1e-12
+    corrs  = numer / denom                                  # (n_windows, n_states)
+    labels = np.argmax(corrs, axis=1)
+
+    # Fingerprint: per-state average of raw FC (interpretable)
+    n_rois      = brain_states.shape[1]
+    fingerprint = np.zeros((n_states, n_rois, n_rois))
+    for k in range(n_states):
+        mask = labels == k
+        if mask.sum() > 0:
+            fingerprint[k] = fc_windows[mask].mean(0)
+
+    # Dwell time
+    dwell_time = np.array([(labels == k).mean() for k in range(n_states)])
+
+    # Transition matrix
+    transitions = np.zeros((n_states, n_states))
+    for t in range(len(labels) - 1):
+        transitions[labels[t], labels[t + 1]] += 1
+    row_sums = transitions.sum(axis=1, keepdims=True)
+    row_sums[row_sums == 0] = 1
+    transitions /= row_sums
+
+    return labels, fingerprint, dwell_time, transitions
+
+
+def extract_features(ts, brain_states, grand_mean_fc, window_size,
+                     feature_type='connectome'):
+    """
+    Flatten all dynamic features into a 1-D vector for a classifier.
+
+    Feature vector layout:
+      [ upper-tri of fingerprint[0..n_states-1],
+        dwell_time,
+        transitions.flatten() ]
+    """
+    _, fingerprint, dwell_time, transitions = transform_subject(
+        ts, brain_states, grand_mean_fc, window_size, feature_type
+    )
+    n_rois = brain_states.shape[1]
+    idx_i, idx_j = np.triu_indices(n_rois, k=1)
+    fp_vec = fingerprint[:, idx_i, idx_j].flatten()
+    return np.concatenate([fp_vec, dwell_time, transitions.flatten()])
+
+
+def predict_behavioral_loocv(fingerprints, scores, n_bootstrap=200,
+                              bootstrap_fracs=(0.8, 0.85, 0.9, 0.95),
+                              alpha=0.05, stability_thresh=0.80):
+    """
+    LOOCV prediction of behavioral scores from per-state fingerprint features.
+
+    Feature selection:
+      - Bootstrap Spearman stability: a feature is selected if p < alpha in
+        >= stability_thresh fraction of bootstrap iterations.
+      - Sign is determined from the full training-fold Spearman (not bootstrap
+        majority) — consistently significant features will have a consistent sign.
+
+    Prediction:
+      - feature_strength = mean(pos_features) − mean(neg_features) per subject
+      - LinearRegression fit on training feature strengths, applied to test subject
+
+    Parameters
+    ----------
+    fingerprints    : (n_subjects, n_features)  upper-tri FC for one state
+    scores          : (n_subjects,)             behavioral scores
+    n_bootstrap     : int
+    bootstrap_fracs : sequence of floats        sampling fractions
+    alpha           : float                     Spearman p-value threshold
+    stability_thresh: float                     min fraction of iterations for selection
+
+    Returns
+    -------
+    y_pred : (n_subjects,)  predicted scores
+    r      : float          Pearson r between y_pred and scores
+    pval   : float          two-tailed p-value for r
+    """
+    n      = len(scores)
+    y_pred = np.zeros(n)
+
+    for train_idx, test_idx in LeaveOneOut().split(fingerprints):
+        X_tr, y_tr = fingerprints[train_idx], scores[train_idx]
+        X_te       = fingerprints[test_idx]
+        n_tr       = len(X_tr)
+
+        feature_counts = np.zeros(X_tr.shape[1])
+        valid_iters    = 0
+
+        for _ in range(n_bootstrap):
+            frac     = np.random.choice(bootstrap_fracs)
+            n_sample = int(round(frac * n_tr))
+            idx      = np.random.choice(n_tr, size=n_sample, replace=False)
+            X_b, y_b = X_tr[idx], y_tr[idx]
+            _, pvals = _spearman_batch(X_b, y_b)
+            feature_counts += (pvals < alpha)
+            valid_iters    += 1
+
+        selected = np.where(feature_counts / valid_iters >= stability_thresh)[0]
+        if len(selected) == 0:
+            selected = np.arange(X_tr.shape[1])
+
+        rhos_full, _ = _spearman_batch(X_tr[:, selected], y_tr)
+        pos_mask = rhos_full > 0
+        pos_sel  = selected[pos_mask]
+        neg_sel  = selected[~pos_mask]
+
+        def _fs(X):
+            val = np.zeros(len(X))
+            if len(pos_sel) > 0:
+                val += X[:, pos_sel].mean(axis=1)
+            if len(neg_sel) > 0:
+                val -= X[:, neg_sel].mean(axis=1)
+            return val
+
+        lr = LinearRegression().fit(_fs(X_tr).reshape(-1, 1), y_tr)
+        y_pred[test_idx] = lr.predict(_fs(X_te).reshape(-1, 1))
+
+    r, pval = pearsonr(y_pred, scores)
+    return y_pred, r, pval
+
+
+# ── Batch helper ──────────────────────────────────────────────────────────────
+
+def transform_all(ts_list, brain_states, grand_mean_fc, window_size,
+                  feature_type='connectome'):
+    """
+    Apply transform_subject to every subject in ts_list.
+
+    Returns
+    -------
+    all_labels      : list of (n_windows,) arrays
+    all_fingerprints: (n_subjects, n_states, n_rois, n_rois)
+    all_dwell       : (n_subjects, n_states)
+    all_transitions : (n_subjects, n_states, n_states)
+    """
+    fps, dwells, trans, labels = [], [], [], []
+    for ts in ts_list:
+        lbl, fp, dw, tr = transform_subject(
+            ts, brain_states, grand_mean_fc, window_size, feature_type
+        )
+        labels.append(lbl)
+        fps.append(fp)
+        dwells.append(dw)
+        trans.append(tr)
+    return labels, np.array(fps), np.array(dwells), np.array(trans)
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Dynamic functional connectivity fingerprinting"
+    )
+    parser.add_argument("--data", type=str, default=None,
+                        help="Path to .npz file containing ts or ts_list")
+    parser.add_argument("--output", type=str, default="dynamic_fingerprints.npz")
+    parser.add_argument("--window-size", type=int, default=15)
+    parser.add_argument("--subject-clusters", type=int, default=20)
+    parser.add_argument("--states", type=int, default=7)
+    parser.add_argument("--feature-type", type=str, default="connectome",
+                        choices=["connectome", "strength"])
+    parser.add_argument("--seed", type=int, default=42)
+    args = parser.parse_args()
+
+    np.random.seed(args.seed)
+
+    # 1. Load data or generate demonstration data
+    if args.data is not None:
+        data = np.load(args.data, allow_pickle=True)
+
+        if "ts_list" in data:
+            ts_list = list(data["ts_list"])
+        elif "ts" in data:
+            ts_list = list(data["ts"])
+        else:
+            raise ValueError("Input must contain 'ts' or 'ts_list'.")
+
+        scores = data["scores"] if "scores" in data else None
+
+    else:
+        print("No data supplied. Running synthetic demonstration.")
+        rng = np.random.default_rng(args.seed)
+        ts_list = [
+            rng.normal(size=(100, 10))
+            for _ in range(8)
+        ]
+        scores = None
+
+    # Validate input
+    if not ts_list:
+        raise ValueError("No subjects found.")
+
+    n_rois = ts_list[0].shape[1]
+    for i, ts in enumerate(ts_list):
+        if ts.ndim != 2 or ts.shape[1] != n_rois:
+            raise ValueError(f"Invalid shape for subject {i}: {ts.shape}")
+        if ts.shape[0] < max(args.window_size, 3):
+            raise ValueError(f"Insufficient timepoints for subject {i}")
+        if not np.isfinite(ts).all():
+            raise ValueError(f"Non-finite values in subject {i}")
+
+    print(f"\nSubjects: {len(ts_list)}")
+    print(f"ROIs: {n_rois}")
+    print(f"Window size: {args.window_size} TRs")
+
+    # 2. Learn shared brain states
+    brain_states, grand_mean_fc = fit_brain_states(
+        ts_list=ts_list,
+        window_size=args.window_size,
+        n_subject_clusters=args.subject_clusters,
+        n_states=args.states,
+        seed=args.seed,
+        feature_type=args.feature_type
+    )
+
+    # 3. Extract individual dynamic fingerprints
+    labels, fingerprints, dwell_times, transitions = transform_all(
+        ts_list=ts_list,
+        brain_states=brain_states,
+        grand_mean_fc=grand_mean_fc,
+        window_size=args.window_size,
+        feature_type=args.feature_type
+    )
+
+    print("\nExtracted features:")
+    print("Brain states:", brain_states.shape)
+    print("Fingerprints:", fingerprints.shape)
+    print("Dwell times:", dwell_times.shape)
+    print("Transitions:", transitions.shape)
+
+    # 4. Save results
+    np.savez_compressed(
+        args.output,
+        brain_states=brain_states,
+        grand_mean_fc=grand_mean_fc,
+        fingerprints=fingerprints,
+        dwell_times=dwell_times,
+        transitions=transitions,
+        labels=np.array(labels, dtype=object)
+    )
+    print(f"\nSaved results to: {args.output}")
+
+    # 5. Optional behavioral prediction (exploratory)
+    if scores is not None:
+        scores = np.asarray(scores, dtype=float).reshape(-1)
+        if len(scores) != len(ts_list):
+            raise ValueError("Number of scores must equal number of subjects.")
+
+        print("\nBehavioral score prediction by brain state:")
+
+        idx_i, idx_j = np.triu_indices(n_rois, k=1)
+
+        for state in range(len(brain_states)):
+            X_state = fingerprints[:, state, idx_i, idx_j]
+
+            y_pred, r, pval = predict_behavioral_loocv(
+                X_state,
+                scores,
+                n_bootstrap=200
+            )
+
+            print(f"State {state + 1}: r = {r:.3f}, p = {pval:.4f}")
+
+    print("\nDynamic fingerprinting completed.")
