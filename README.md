@@ -68,7 +68,7 @@ The framework is designed to support investigations of individual differences in
 
 ## Citation
 
-Citation information and related publications will be provided with future updates.
+Ghaffari, Amin, et al. "Dynamic fingerprinting of the human functional connectome." Brain Connectivity 16.2-3 (2026): 142-154.
 
 ## License
 
